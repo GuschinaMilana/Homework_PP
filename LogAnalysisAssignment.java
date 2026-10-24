@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -193,8 +194,8 @@ public class LogAnalysisAssignment {
     ) {}
 
 
+    // последовательный отчёт
     public static SequentialResult analyzeSequential(Path directory) throws IOException {
-        // 1. Собрать список файлов (порядок детерминированный — для воспроизводимости).
         List<Path> files;
         try (var stream = Files.list(directory)) {
             files = stream
@@ -209,7 +210,6 @@ public class LogAnalysisAssignment {
         long corruptedLines = 0;
         long failedFiles = 0;
 
-        // 2. Один поток: последовательно обходим файлы.
         for (Path file : files) {
             try {
                 Iterator<String> it = LogFileLines.iterator(file);
@@ -222,19 +222,14 @@ public class LogAnalysisAssignment {
                                 .add(entry);
                         parsedLines++;
                     } catch (IllegalArgumentException badLine) {
-                        // Политика: пропускаем только повреждённую строку,
-                        // файл продолжаем читать.
                         corruptedLines++;
                     }
                 }
             } catch (RuntimeException fileError) {
-                // Политика: файл не удалось прочитать целиком —
-                // не валим весь анализ, учитываем как failedFiles.
                 failedFiles++;
             }
         }
 
-        // 3. Снимок: превращаем изменяемые аккумуляторы в неизменяемые record'ы.
         Map<String, PathStatistics> byPath = new LinkedHashMap<>();
         acc.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
@@ -245,7 +240,7 @@ public class LogAnalysisAssignment {
         );
     }
 
-
+    // частичный отчёт
     public static ParallelResult analyzeParallel(
             Path directory,
             int threadCount,
@@ -254,13 +249,11 @@ public class LogAnalysisAssignment {
             AtomicBoolean stopFlag
     ) throws IOException, InterruptedException {
 
-        // ---- ч.3: список файлов ----
         List<Path> files;
         try (var stream = Files.list(directory)) {
             files = stream.filter(Files::isRegularFile).sorted().toList();
         }
 
-        // ---- ч.4: выбор аккумулятора ----
         GlobalLockAccumulator globalLock = usePerPathLock ? null : new GlobalLockAccumulator();
         PerPathAccumulator  perPath    = usePerPathLock ? new PerPathAccumulator() : null;
         java.util.function.Consumer<LogEntry> sink = usePerPathLock
@@ -268,13 +261,10 @@ public class LogAnalysisAssignment {
 
         Counters counters = new Counters();
 
-        // ---- ч.5: семафор ----
         Semaphore semaphore = new Semaphore(semaphoreLimit);
 
-        // ---- ч.7: latch ----
         CountDownLatch latch = new CountDownLatch(files.size());
 
-        // ---- ч.3: фиксированный пул ----
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         List<Future<?>> futures = new ArrayList<>(files.size());
 
@@ -283,53 +273,43 @@ public class LogAnalysisAssignment {
                 futures.add(executor.submit(() -> {
                     boolean permitAcquired = false;
                     try {
-                        // ---- ч.8: проверка остановки до начала работы ----
                         if (stopFlag.get()) return;
 
-                        // ---- ч.5: получить разрешение ПЕРЕД чтением файла ----
                         semaphore.acquire();
                         permitAcquired = true;
 
-                        // ---- ч.6: наблюдение активных файлов ----
                         int now = counters.activeFiles.incrementAndGet();
                         counters.observeActive(now);
 
-                        // ---- ч.3: свой итератор на файл ----
                         Iterator<String> it = LogFileLines.iterator(file);
                         while (it.hasNext()) {
-                            // ---- ч.8: не начинать новую строку после остановки ----
                             if (stopFlag.get()) break;
 
                             String line = it.next();
                             counters.linesRead.incrementAndGet();
                             try {
-                                LogEntry entry = parseLogEntry(line);   // ч.1
-                                sink.accept(entry);                     // ч.3/4
+                                LogEntry entry = parseLogEntry(line);
+                                sink.accept(entry);
                                 counters.entriesParsed.incrementAndGet();
                             } catch (IllegalArgumentException badLine) {
-                                // ---- ч.9: политика — пропустить строку ----
                                 counters.corruptedLines.incrementAndGet();
                             }
                         }
                         counters.filesProcessed.incrementAndGet();
                     } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();            // ч.8: корректный выход
+                        Thread.currentThread().interrupt();
                     } catch (RuntimeException fileError) {
-                        // ---- ч.9: политика — файл не мешает остальным ----
                         counters.failedFiles.incrementAndGet();
                     } finally {
-                        // ---- ч.6: activeFiles уменьшается всегда ----
                         if (permitAcquired) {
                             counters.activeFiles.decrementAndGet();
-                            semaphore.release();                        // ч.5: вернуть разрешение
+                            semaphore.release();
                         }
-                        latch.countDown();                              // ч.7: всегда
+                        latch.countDown();
                     }
                 }));
             }
 
-            // ---- ч.7 + ч.3: ждём завершения ----
-            // Вариант 1: Future.get() на каждую задачу.
             for (Future<?> f : futures) {
                 try {
                     f.get();
@@ -337,8 +317,7 @@ public class LogAnalysisAssignment {
                     counters.failedFiles.incrementAndGet();
                 }
             }
-            // Вариант 2 (дублирующий, для наглядности ч.7):
-            // latch.await();
+
 
         } finally {
             executor.shutdown();
@@ -347,7 +326,6 @@ public class LogAnalysisAssignment {
             }
         }
 
-        // ---- сборка результата ----
         Map<String, PathStatistics> byPath = usePerPathLock
                 ? perPath.snapshot() : globalLock.snapshot();
 
@@ -392,16 +370,8 @@ public class LogAnalysisAssignment {
         return new Report(total, ok, err, bytes, maxDur);
     }
 
-    static final class Counters {
-        final AtomicLong filesProcessed     = new AtomicLong();
-        final AtomicLong linesRead          = new AtomicLong();
-        final AtomicLong entriesParsed      = new AtomicLong();
-        final AtomicLong corruptedLines     = new AtomicLong();
-        final AtomicLong failedFiles        = new AtomicLong();
-        // activeFiles/maxActiveFiles появятся в части 5–6 вместе с Semaphore
-    }
 
-    /** Изменяемый аккумулятор по одному URL. Только для одного потока. */
+    // аккумулятор для одного потока
     private static final class PathAccumulator {
         long requests;
         long successful;
@@ -433,61 +403,7 @@ public class LogAnalysisAssignment {
     }
 
 
-    /** Изменяемый аккумулятор по одному URL. Не потокобезопасен сам по себе. */
-    static final class PathAccumulator {
-        long requests, successful, errors;
-        long responseBytes, totalDurationMillis, maxDurationMillis;
-
-        void add(LogEntry e) {
-            requests++;
-            responseBytes += e.responseBytes();
-            totalDurationMillis += e.durationMillis();
-            if (e.durationMillis() > maxDurationMillis) {
-                maxDurationMillis = e.durationMillis();
-            }
-            if (e.status() >= 200 && e.status() < 400) successful++;
-            else                                        errors++;
-        }
-
-        PathStatistics toStatistics() {
-            return new PathStatistics(requests, successful, errors,
-                    responseBytes, totalDurationMillis, maxDurationMillis);
-        }
-    }
-
-
-    static final class SynchronizedAccumulator {
-
-        /** Изменяемое состояние. Доступ — только под synchronized(this). */
-        private final Map<String, PathAccumulator> byPath = new HashMap<>();
-
-        /** Добавить одну запись. Единственная точка мутации состояния. */
-        synchronized void add(LogEntry e) {
-            byPath.computeIfAbsent(e.path(), k -> new PathAccumulator()).add(e);
-        }
-
-        /**
-         * Неизменяемый снимок: Map<String, PathStatistics> с сортировкой по ключу.
-         * Вызывается после завершения всех воркеров (после awaitTermination),
-         * но синхронизация всё равно нужна — на случай, если кто-то вызовет
-         * snapshot() параллельно с add().
-         */
-        synchronized Map<String, PathStatistics> snapshot() {
-            Map<String, PathStatistics> result = new LinkedHashMap<>();
-            byPath.entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .forEach(en -> result.put(en.getKey(), en.getValue().toStatistics()));
-            return result;
-        }
-
-        /** Для диагностики/тестов: сколько URL накоплено. */
-        synchronized int size() {
-            return byPath.size();
-        }
-    }
-
-
-    /** Вариант A (ч.4): один общий synchronized-метод. */
+    // общий synhronized-метод
     static final class GlobalLockAccumulator {
         private final Map<String, PathAccumulator> byPath = new HashMap<>();
 
@@ -504,7 +420,7 @@ public class LogAnalysisAssignment {
         }
     }
 
-    /** Вариант B (ч.4): ConcurrentHashMap + блокировка на уровне URL. */
+    // для каждого URL и ConcurrentHashMap
     static final class PerPathAccumulator {
         private final ConcurrentHashMap<String, PathAccumulator> byPath =
                 new ConcurrentHashMap<>();
@@ -512,7 +428,7 @@ public class LogAnalysisAssignment {
         void add(LogEntry e) {
             PathAccumulator acc = byPath.computeIfAbsent(
                     e.path(), k -> new PathAccumulator());
-            synchronized (acc) {          // блокировка только по этому URL
+            synchronized (acc) {
                 acc.add(e);
             }
         }
@@ -541,7 +457,7 @@ public class LogAnalysisAssignment {
         final AtomicInteger activeFiles  = new AtomicInteger();
         final AtomicInteger maxActiveFiles = new AtomicInteger();
 
-        /** CAS-обновление максимума (ч.6). */
+        // CAS-обновление максимума
         void observeActive(int current) {
             int prev;
             do {
@@ -793,11 +709,11 @@ public class LogAnalysisAssignment {
                 SequentialResult result = analyzeSequential(directory);
                 Report report = toReport(result);
 
-                System.out.println("Files failed:    " + result.failedFiles());
-                System.out.println("Lines total:     " + result.totalLines());
-                System.out.println("Lines parsed:    " + result.parsedLines());
+                System.out.println("Files failed: " + result.failedFiles());
+                System.out.println("Lines total: " + result.totalLines());
+                System.out.println("Lines parsed: " + result.parsedLines());
                 System.out.println("Lines corrupted: " + result.corruptedLines());
-                System.out.println("Report:          " + report);
+                System.out.println("Report: " + report);
                 result.byPath().forEach((path, s) ->
                         System.out.println("  " + path + " -> " + s));
                 return;
@@ -810,18 +726,16 @@ public class LogAnalysisAssignment {
                 boolean perPath = args.length > 4 && args[4].equals("perPath");
 
                 AtomicBoolean stop = new AtomicBoolean(false);
-                // Пример досрочной остановки: отдельный поток выставляет флаг через N мс.
-                // new Thread(() -> { sleep(50); stop.set(true); }).start();
 
                 ParallelResult r = analyzeParallel(dir, threads, semLimit, perPath, stop);
-                System.out.println("stoppedEarly:    " + r.stoppedEarly());
-                System.out.println("maxActiveFiles:  " + r.maxActiveFiles());
-                System.out.println("filesProcessed:  " + r.filesProcessed());
-                System.out.println("linesRead:       " + r.linesRead());
-                System.out.println("entriesParsed:   " + r.entriesParsed());
-                System.out.println("corruptedLines:  " + r.corruptedLines());
-                System.out.println("failedFiles:     " + r.failedFiles());
-                System.out.println("Report:          " + toReport(r));
+                System.out.println("stoppedEarly: " + r.stoppedEarly());
+                System.out.println("maxActiveFiles: " + r.maxActiveFiles());
+                System.out.println("filesProcessed: " + r.filesProcessed());
+                System.out.println("linesRead: " + r.linesRead());
+                System.out.println("entriesParsed: " + r.entriesParsed());
+                System.out.println("corruptedLines: " + r.corruptedLines());
+                System.out.println("failedFiles: " + r.failedFiles());
+                System.out.println("Report: " + toReport(r));
                 return;
             }
 
